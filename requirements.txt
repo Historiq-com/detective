@@ -1,0 +1,20 @@
+# requirements.txt
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+
+torch==2.3.1           # CPU build; swap to cu121 variant on GPU
+torchvision==0.18.1
+numpy==1.26.4
+pillow==10.3.0
+opencv-python==4.10.0.84
+
+transformers==4.42.3
+huggingface-hub==0.23.4
+
+google-genai==0.6.0
+
+# IMPORTANT: need a recent Ultralytics with SAM 2.1 support
+ultralytics>=8.3.0
+
+requests==2.32.3
