@@ -9,6 +9,9 @@ from google.auth import impersonated_credentials
 # The Cloud Run SERVICE URL **origin only** (no path, no trailing slash):
 BASE_ORIGIN = "https://seg-api-dev-268616946422.us-central1.run.app"
 
+#test on localhost
+#BASE_ORIGIN = "http://localhost:8080"
+
 # Endpoint paths exactly as your app defines them:
 HEALTH_PATH  = "/healthz"   # GET
 PREDICT_PATH = "/predict"   # POST

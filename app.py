@@ -25,10 +25,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Project/location for Vertex AI
 PROJECT  = os.getenv("GOOGLE_CLOUD_PROJECT", "vlgo-site-567f8")
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
 OWL_REPO = os.getenv("OWL_REPO", "google/owlv2-base-patch16")
-OWL_SCORE_THRESH = float(os.getenv("OWL_SCORE_THRESH", "0.25"))
+OWL_SCORE_THRESH = float(os.getenv("OWL_SCORE_THRESH", "0.1"))
 
 # Ultralytics weight id (auto-downloads on first use)
 ULTRA_SAM_WEIGHTS = os.getenv("ULTRA_SAM_WEIGHTS", "sam2.1_b.pt")
@@ -39,7 +39,7 @@ PERSON_SYNONYMS = {"person","people","man","woman","boy","girl","human","men","w
 @dataclass
 class Item:
     name: str
-    context: str
+    context: str = ""  # optional
 
 @dataclass
 class Det:
@@ -47,7 +47,7 @@ class Det:
     score: float
     bbox: Tuple[float, float, float, float]  # [x0,y0,x1,y1]
 
-app = FastAPI(title="Gemini (Vertex AI) + OWLv2 + SAM 2.1 (Ultralytics)", version="1.0")
+app = FastAPI(title="Gemini (Vertex AI) + OWLv2 + SAM 2.1 (Ultralytics)", version="1.1")
 
 # ---------------- Utilities ----------------
 def mask_to_png_b64(mask_bool: np.ndarray) -> str:
@@ -64,15 +64,28 @@ def normalize_label(s: str) -> str:
     s2 = s.strip().lower()
     return "person" if s2 in PERSON_SYNONYMS else s.strip()
 
+def _expand_people_queries(vocab: List[str]) -> List[str]:
+    """Add a 'person' variant for gendered people phrases to boost OWL recall."""
+    expanded = []
+    for v in vocab:
+        expanded.append(v)
+        low = v.lower()
+        for term in ["woman","women","man","men","girl","boy","people","person(s)"]:
+            if term in low:
+                expanded.append(low.replace(term, "person"))
+                break
+    # preserve order, drop dups
+    return list(dict.fromkeys(expanded))
+
 # ---------------- Startup: load models ----------------
 @app.on_event("startup")
 def _load_models():
     # Gemini via Vertex AI using service account / ADC
     app.state.gemini = genai.Client(
-    vertexai=True,
-    project=PROJECT,
-    location=LOCATION,
-)
+        vertexai=True,
+        project=PROJECT,
+        location=LOCATION,
+    )
 
     # OWLv2
     app.state.owl_proc = AutoProcessor.from_pretrained(OWL_REPO)
@@ -85,33 +98,47 @@ def _load_models():
 def healthz():
     return PlainTextResponse("ok", 200)
 
-# ---------------- Step 1: Gemini subjects/objects + context ----------------
+# ---------------- Step 1: Gemini subjects/objects (OWLv2-ready phrases) ----------------
 def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List[Item]]:
+    # Minimal schema with optional context; phrases constrained for OWLv2
     schema = {
         "type": "object",
         "properties": {
             "subjects": {"type": "array", "items": {
                 "type": "object",
-                "properties": {"name":{"type":"string"}, "context":{"type":"string"}},
-                "required": ["name","context"]
+                "properties": {
+                    "name": {"type":"string", "minLength":2, "maxLength":64},
+                    "context": {"type":"string"}
+                },
+                "required": ["name"],
+                "additionalProperties": False
             }},
             "objects": {"type": "array", "items": {
                 "type": "object",
-                "properties": {"name":{"type":"string"}, "context":{"type":"string"}},
-                "required": ["name","context"]
+                "properties": {
+                    "name": {"type":"string", "minLength":2, "maxLength":64},
+                    "context": {"type":"string"}
+                },
+                "required": ["name"],
+                "additionalProperties": False
             }},
         },
-        "required": ["subjects","objects"]
+        "required": ["subjects","objects"],
+        "additionalProperties": False
     }
 
     prompt = (
-        "List visible entities in two groups:\n"
-        "1) subjects = the primary human actors.\n"
-        "2) objects = notable non-human items.\n"
-        "For each item return JSON fields:\n"
-        "- name: Be extremely descriptive with the fewest number of words possible to describe the item. This description witll be used by an OWLv2 model to detect the item in the image.\n"
-        "- context: One sentence explaining its importance of the itemin the historical context of the image. Your audience is archivists and historians.\n"
-        "No coordinates or masks."
+        "Return ONLY JSON matching the schema.\n"
+        "Goal: produce short OWLv2-ready phrases (2–6 words) that uniquely identify visible people (subjects) "
+        "and notable non-human items (objects).\n\n"
+        "Rules:\n"
+        "- Keep each 'name' to 2–6 words, no commas, no 'and'.\n"
+        "- Be specific: add ONE helpful disambiguator (color/material/action/location).\n"
+        "  Good: 'woman sweeping with broom', 'man eating sandwich', 'blue enamel mug', 'wooden dining chair'.\n"
+        "  Bad: 'cup', 'person with thing'.\n"
+        "- Use 'man'/'woman' only if obvious; otherwise 'person'.\n"
+        "- 'context' is optional; include only if meaningful for archivists.\n"
+        "- No counts/coords/masks. No text outside JSON."
     )
 
     part = gtypes.Part.from_bytes(data=img_bytes, mime_type=mime or "image/jpeg")
@@ -120,12 +147,36 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
         contents=[part, prompt],
         config=gtypes.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=schema
+            response_schema=schema,
+            temperature=0.0, top_p=1.0, max_output_tokens=2048
         ),
     )
+    if not resp.text:
+        # Check if response was truncated due to token limit
+        if (hasattr(resp, 'candidates') and resp.candidates and 
+            resp.candidates[0].finish_reason and 
+            str(resp.candidates[0].finish_reason) == 'FinishReason.MAX_TOKENS'):
+            raise ValueError("Response truncated due to token limit. Consider increasing max_output_tokens.")
+        raise ValueError(f"Empty response from Gemini API. Response: {resp}")
     data = json.loads(resp.text)
-    subs = [Item(**x) for x in data.get("subjects", [])]
-    objs = [Item(**x) for x in data.get("objects", [])]
+
+    # Cleanup: trim, dedup (case-insensitive), keep optional context
+    def _clean(items):
+        seen = set()
+        out = []
+        for x in items or []:
+            name = " ".join((x.get("name","")).split())
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(Item(name=name, context=x.get("context","") or ""))
+        return out
+
+    subs = _clean(data.get("subjects", []))
+    objs = _clean(data.get("objects", []))
     return {"subjects": subs, "objects": objs}
 
 # ---------------- Step 2: OWLv2 boxes for labels ----------------
@@ -158,7 +209,6 @@ def step2_owl_boxes(image: Image.Image, label_vocab: List[str]) -> List[Det]:
             score=float(s),
             bbox=(float(b[0]), float(b[1]), float(b[2]), float(b[3]))
         ))
-    # sort by score desc
     dets.sort(key=lambda d: d.score, reverse=True)
     return dets
 
@@ -190,17 +240,13 @@ def step3_sam_masks_ultralytics(image: Image.Image, boxes_xyxy: List[Tuple[float
     if not boxes_xyxy:
         return []
 
-    # Ultralytics expects a list of bboxes per image:
-    # predict(source, bboxes=[[x1,y1,x2,y2], ...], imgsz=<opt>)
     results = app.state.sam.predict(
         source=image,
         bboxes=[list(map(float, b)) for b in boxes_xyxy],
         verbose=False
     )
-    # results is a list per image; we passed one image → results[0]
     r = results[0]
 
-    # r.masks.data is a tensor [N, H, W] (boolean-ish 0/1)
     masks_bool: List[np.ndarray] = []
     if r.masks is not None and hasattr(r.masks, "data"):
         m = r.masks.data  # torch.Tensor
@@ -208,7 +254,6 @@ def step3_sam_masks_ultralytics(image: Image.Image, boxes_xyxy: List[Tuple[float
         for i in range(m.shape[0]):
             masks_bool.append(m[i])
     else:
-        # No masks found for the given boxes (rare); return empties aligned to image size
         W, H = image.size
         for _ in boxes_xyxy:
             masks_bool.append(np.zeros((H, W), dtype=bool))
@@ -221,14 +266,19 @@ async def predict(image: UploadFile = File(...)):
     mime = image.content_type or "image/jpeg"
     pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-    # 1) Gemini → names + one-sentence context
+    # 1) Gemini → OWLv2-ready phrases (+ optional context)
     lists = step1_gemini_subjects_objects(img_bytes, mime)
     subjects: List[Item] = lists["subjects"]
     objects:  List[Item] = lists["objects"]
 
-    # 2) OWLv2 → boxes for union of labels
+    # 2) OWLv2 → boxes for union of labels (with 'person' fallbacks for gendered phrases)
     vocab = [it.name for it in subjects] + [it.name for it in objects]
+    vocab = _expand_people_queries(vocab)
     dets = step2_owl_boxes(pil, vocab)
+
+    # Optional debug on total miss
+    if not dets:
+        print("[OWL] No detections for queries:", vocab)
 
     subj_dets = assign_detections_to_items(subjects, dets)
     obj_dets  = assign_detections_to_items(objects, dets)
