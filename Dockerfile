@@ -10,6 +10,12 @@ COPY requirements.txt /app/requirements.txt
 WORKDIR /app
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy the SAM 2.1 model file to avoid downloading it every time
+COPY sam2.1_b.pt /app/sam2.1_b.pt
+
+# Copy the OWLv2 model files to avoid downloading from Hugging Face
+COPY owlv2-model/ /app/owlv2-model/
+
 COPY app.py /app/app.py
 
 EXPOSE 8080

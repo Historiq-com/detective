@@ -27,7 +27,9 @@ PROJECT  = os.getenv("GOOGLE_CLOUD_PROJECT", "vlgo-site-567f8")
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
-OWL_REPO = os.getenv("OWL_REPO", "google/owlv2-base-patch16")
+# Use local OWLv2 model path to avoid Hugging Face rate limits
+# For local testing, use relative path; for Docker, use /app/owlv2-model
+OWL_REPO = os.getenv("OWL_REPO", "/app/owlv2-model")
 OWL_SCORE_THRESH = float(os.getenv("OWL_SCORE_THRESH", "0.1"))
 
 # Ultralytics weight id (auto-downloads on first use)
