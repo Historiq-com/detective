@@ -45,8 +45,10 @@ def _id_token_via_impersonation(aud: str) -> str:
         target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
         lifetime=3600,
     )
-    id_creds = impersonated_credentials.IDTokenCredentials.from_credentials(
-        target, target_audience=aud
+    id_creds = impersonated_credentials.IDTokenCredentials(
+        target_credentials=target,
+        target_audience=aud,
+        include_email=True
     )
     id_creds.refresh(Request())
     return id_creds.token
