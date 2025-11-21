@@ -52,4 +52,3 @@ images:
   - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg'
 options:
   logging: CLOUD_LOGGING_ONLY
-  serviceAccount: "projects/vlgo-site-567f8/serviceAccounts/vertex-ai-app@vlgo-site-567f8.iam.gserviceaccount.com"
