@@ -2,10 +2,14 @@ steps:
   # Build the container image
   - name: 'gcr.io/cloud-builders/docker'
     args: ['build', '-t', 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg', '.']
+    env:
+      - "CLOUDSDK_CORE_PROJECT=$PROJECT_ID"
 
   # Push the container image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
     args: ['push', 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg']
+    env:
+      - "CLOUDSDK_CORE_PROJECT=$PROJECT_ID"
 
   # Deploy to Cloud Run with flags (no external YAML)
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -42,8 +46,10 @@ steps:
       - '--no-allow-unauthenticated'
     env:
       - "CLOUDSDK_CORE_PROJECT=$PROJECT_ID"
+      - "CLOUDSDK_AUTH_IMPLICIT_PROJECT=$PROJECT_ID"
 
 images:
   - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg'
 options:
   logging: CLOUD_LOGGING_ONLY
+  serviceAccount: "projects/vlgo-site-567f8/serviceAccounts/vertex-ai-app@vlgo-site-567f8.iam.gserviceaccount.com"
