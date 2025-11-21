@@ -1,0 +1,47 @@
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg', '.']
+
+  # Push the container image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg']
+
+  # Deploy to Cloud Run with flags (no external YAML)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'detective-seg'
+      - '--image'
+      - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--service-account'
+      - 'vertex-ai-app@vlgo-site-567f8.iam.gserviceaccount.com'
+      - '--execution-environment'
+      - 'gen2'
+      - '--no-cpu-throttling'
+      - '--cpu'
+      - '4'
+      - '--memory'
+      - '16Gi'
+      - '--concurrency'
+      - '1'
+      - '--timeout'
+      - '1200'
+      - '--ingress'
+      - 'all'
+      - '--accelerator'
+      - 'type=nvidia-l4,count=1'
+      - '--update-env-vars'
+      - 'SAM3_GCS_URI=gs://historiq-sam3,GOOGLE_CLOUD_PROJECT=vlgo-site-567f8,GEMINI_MODEL=gemini-3-pro-preview'
+      - '--allow-unauthenticated=false'
+    env:
+      - "CLOUDSDK_CORE_PROJECT=$PROJECT_ID"
+
+images:
+  - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg'
