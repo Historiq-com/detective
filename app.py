@@ -1,42 +1,38 @@
 # app.py
-import os, io, json, base64
+import os, io, json, base64, logging
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Iterable
 
 import numpy as np
 from PIL import Image
-import cv2
 import torch
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# --- Gemini 2.5 Flash via Vertex AI (service account / ADC) ---
+# --- Gemini 3 Pro via Vertex AI (service account / ADC) ---
 from google import genai
-from google.genai import types as gtypes
+from google.genai.types import GenerateContentConfig, Part
+from google.cloud import storage
 
-# --- OWLv2 (open-vocab detector) ---
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-
-# --- Ultralytics SAM 2.1 ---
-from ultralytics import SAM
+# --- Meta SAM 3 (detection + segmentation) ---
+from transformers import Sam3Model, Sam3Processor
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SAM3_DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 
 # Project/location for Vertex AI
 PROJECT  = os.getenv("GOOGLE_CLOUD_PROJECT", "vlgo-site-567f8")
-LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+# Gemini 3 lives in the global multi-region; keep this fixed for simplicity.
+LOCATION = "global"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview")
 
-# Use local OWLv2 model path to avoid Hugging Face rate limits
-# For local testing, use relative path; for Docker, use /app/owlv2-model
-OWL_REPO = os.getenv("OWL_REPO", "/app/owlv2-model")
-OWL_SCORE_THRESH = float(os.getenv("OWL_SCORE_THRESH", "0.1"))
-
-# Ultralytics weight id (auto-downloads on first use)
-ULTRA_SAM_WEIGHTS = os.getenv("ULTRA_SAM_WEIGHTS", "sam2.1_b.pt")
-
-# Helpful normalization for person labels coming from Gemini
-PERSON_SYNONYMS = {"person","people","man","woman","boy","girl","human","men","women","person(s)"}
+# SAM 3 model storage
+SAM3_LOCAL_PATH = os.getenv("SAM3_LOCAL_PATH", "/app/sam3")
+SAM3_LOCAL_FALLBACK = "/Users/dserrentino/sam3"
+SAM3_GCS_URI = os.getenv("SAM3_GCS_URI", "gs://historiq-sam3")
+SAM3_SCORE_THRESH = float(os.getenv("SAM3_SCORE_THRESH", "0.05"))
+SAM3_MASK_THRESH = float(os.getenv("SAM3_MASK_THRESH", "0.5"))
 
 @dataclass
 class Item:
@@ -44,12 +40,12 @@ class Item:
     context: str = ""  # optional
 
 @dataclass
-class Det:
-    label: str
+class Instance:
     score: float
     bbox: Tuple[float, float, float, float]  # [x0,y0,x1,y1]
+    mask: Optional[np.ndarray] = None
 
-app = FastAPI(title="Gemini (Vertex AI) + OWLv2 + SAM 2.1 (Ultralytics)", version="1.1")
+app = FastAPI(title="Gemini 3 + SAM 3 (Meta) inference API", version="2.0")
 
 # ---------------- Utilities ----------------
 def mask_to_png_b64(mask_bool: np.ndarray) -> str:
@@ -62,22 +58,57 @@ def mask_to_png_b64(mask_bool: np.ndarray) -> str:
     im.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def normalize_label(s: str) -> str:
-    s2 = s.strip().lower()
-    return "person" if s2 in PERSON_SYNONYMS else s.strip()
+# ---------------- Storage helpers ----------------
+def _parse_gs_uri(uri: str) -> Tuple[str, str]:
+    if not uri.startswith("gs://"):
+        raise ValueError(f"Expected gs:// URI, got: {uri}")
+    no_scheme = uri[len("gs://"):]
+    parts = no_scheme.split("/", 1)
+    bucket = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ""
+    return bucket, prefix.rstrip("/")
 
-def _expand_people_queries(vocab: List[str]) -> List[str]:
-    """Add a 'person' variant for gendered people phrases to boost OWL recall."""
-    expanded = []
-    for v in vocab:
-        expanded.append(v)
-        low = v.lower()
-        for term in ["woman","women","man","men","girl","boy","people","person(s)"]:
-            if term in low:
-                expanded.append(low.replace(term, "person"))
-                break
-    # preserve order, drop dups
-    return list(dict.fromkeys(expanded))
+def _download_gcs_directory(uri: str, dest_dir: Path) -> None:
+    """Mirror a small directory of blobs from GCS into dest_dir.
+    This is just getting the model weights from GCS into the container 
+    so we're not downloading the entire model from huggingface live every time."""
+    bucket_name, prefix = _parse_gs_uri(uri)
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = bucket.list_blobs(prefix=prefix)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    found_any = False
+    for blob in blobs:
+        if not blob.name or blob.name.endswith("/"):
+            continue
+        found_any = True
+        rel = blob.name[len(prefix):].lstrip("/") if prefix else blob.name
+        out_path = dest_dir / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        logging.info(f"[SAM3] Downloading gs://{bucket_name}/{blob.name} -> {out_path}")
+        blob.download_to_filename(str(out_path))
+
+    if not found_any:
+        raise FileNotFoundError(f"No blobs found under {uri}")
+
+def _ensure_sam3_weights() -> Path:
+    """Return a path with SAM3 weights, downloading from GCS if needed."""
+    candidates: Iterable[Path] = [
+        Path(SAM3_LOCAL_PATH),
+        Path(SAM3_LOCAL_FALLBACK),
+    ]
+    for cand in candidates:
+        if cand.exists() and (cand / "model.safetensors").exists():
+            return cand
+        if cand.exists() and (cand / "sam3.pt").exists():
+            return cand
+
+    dest = Path(SAM3_LOCAL_PATH)
+    if SAM3_GCS_URI:
+        _download_gcs_directory(SAM3_GCS_URI, dest)
+        return dest
+    raise FileNotFoundError("SAM3 weights not found locally and no GCS URI provided")
 
 # ---------------- Startup: load models ----------------
 @app.on_event("startup")
@@ -89,20 +120,23 @@ def _load_models():
         location=LOCATION,
     )
 
-    # OWLv2
-    app.state.owl_proc = AutoProcessor.from_pretrained(OWL_REPO)
-    app.state.owl = AutoModelForZeroShotObjectDetection.from_pretrained(OWL_REPO).to(DEVICE).eval()
-
-    # Ultralytics SAM 2.1 (auto-downloads weights like "sam2.1_b.pt")
-    app.state.sam = SAM(ULTRA_SAM_WEIGHTS)
+    # SAM 3 (Meta) - detection + segmentation
+    sam3_path = _ensure_sam3_weights()
+    logging.info(f"[SAM3] Loading model from {sam3_path} on {DEVICE} (dtype={SAM3_DTYPE})")
+    app.state.sam3_model = Sam3Model.from_pretrained(
+        str(sam3_path),
+        torch_dtype=SAM3_DTYPE,
+    ).to(DEVICE).eval()
+    app.state.sam3_processor = Sam3Processor.from_pretrained(str(sam3_path))
+    app.state.sam3_path = str(sam3_path)
 
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok", 200)
 
-# ---------------- Step 1: Gemini subjects/objects (OWLv2-ready phrases) ----------------
+# ---------------- Step 1: Gemini subjects/objects (SAM3-ready phrases) ----------------
 def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List[Item]]:
-    # Minimal schema with optional context; phrases constrained for OWLv2
+    # Minimal schema with optional context; phrases constrained for SAM3 text prompts
     schema = {
         "type": "object",
         "properties": {
@@ -131,7 +165,7 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
 
     prompt = (
         "Return ONLY JSON matching the schema.\n"
-        "Goal: produce short OWLv2-ready phrases (2–6 words) that uniquely identify visible people (subjects) "
+        "Goal: produce short SAM3 text prompts (2–6 words) that uniquely identify visible people (subjects) "
         "and notable non-human items (objects).\n\n"
         "Rules:\n"
         "- Keep each 'name' to 2–6 words, no commas, no 'and'.\n"
@@ -143,15 +177,18 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
         "- No counts/coords/masks. No text outside JSON."
     )
 
-    part = gtypes.Part.from_bytes(data=img_bytes, mime_type=mime or "image/jpeg")
+    part = Part.from_bytes(data=img_bytes, mime_type=mime or "image/jpeg")
+    cfg = GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=schema,
+        temperature=0.0,
+        top_p=1.0,
+        max_output_tokens=2048,
+    )
     resp = app.state.gemini.models.generate_content(
         model=GEMINI_MODEL,
         contents=[part, prompt],
-        config=gtypes.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=schema,
-            temperature=0.0, top_p=1.0, max_output_tokens=2048
-        ),
+        config=cfg,
     )
     if not resp.text:
         # Check if response was truncated due to token limit
@@ -181,85 +218,81 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
     objs = _clean(data.get("objects", []))
     return {"subjects": subs, "objects": objs}
 
-# ---------------- Step 2: OWLv2 boxes for labels ----------------
-def step2_owl_boxes(image: Image.Image, label_vocab: List[str]) -> List[Det]:
-    proc = app.state.owl_proc
-    model = app.state.owl
+# ---------------- Step 2: SAM 3 detection + segmentation ----------------
+def _to_device(batch: Dict) -> Dict:
+    moved = {}
+    for k, v in batch.items():
+        if hasattr(v, "to"):
+            moved[k] = v.to(DEVICE)
+        else:
+            moved[k] = v
+    return moved
 
-    vocab = [normalize_label(x) for x in label_vocab]
-    texts = [[v] for v in vocab]
-    inputs = proc(images=image, text=texts, return_tensors="pt").to(DEVICE)
-
-    with torch.inference_mode():
-        outputs = model(**inputs)
-
-    target_sizes = torch.tensor([[image.height, image.width]], device=DEVICE)
-    results = proc.post_process_object_detection(
-        outputs=outputs,
-        threshold=OWL_SCORE_THRESH,
-        target_sizes=target_sizes
-    )[0]
-
-    boxes = results["boxes"].cpu().numpy().tolist()
-    scores = results["scores"].cpu().numpy().tolist()
-    labels_idx = results["labels"].cpu().numpy().tolist()
-
-    dets: List[Det] = []
-    for b, s, li in zip(boxes, scores, labels_idx):
-        dets.append(Det(
-            label=vocab[int(li)],
-            score=float(s),
-            bbox=(float(b[0]), float(b[1]), float(b[2]), float(b[3]))
-        ))
-    dets.sort(key=lambda d: d.score, reverse=True)
-    return dets
-
-def assign_detections_to_items(items: List[Item], dets: List[Det]) -> List[Optional[Det]]:
+def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]:
     """
-    For each item, consume the highest-score unused detection whose label
-    matches the normalized item name (many-to-many handled by popping).
+    For each item, run SAM3 with a text prompt and return a list of instances.
     """
-    buckets: Dict[str, List[Det]] = {}
-    for d in dets:
-        buckets.setdefault(d.label.lower(), []).append(d)
-    for v in buckets.values():
-        v.sort(key=lambda d: d.score, reverse=True)
+    proc: Sam3Processor = app.state.sam3_processor
+    model: Sam3Model = app.state.sam3_model
 
-    assigned: List[Optional[Det]] = []
+    all_results: List[List[Instance]] = []
     for it in items:
-        key = normalize_label(it.name).lower()
-        lst = buckets.get(key, [])
-        det = lst.pop(0) if lst else None
-        assigned.append(det)
-    return assigned
+        prompt = it.name.strip()
+        batch = proc(images=image, text=prompt, return_tensors="pt")
+        batch = _to_device(batch)
 
-# ---------------- Step 3: SAM 2.1 masks (Ultralytics) ----------------
-def step3_sam_masks_ultralytics(image: Image.Image, boxes_xyxy: List[Tuple[float,float,float,float]]) -> List[np.ndarray]:
-    """
-    Use Ultralytics SAM 2.1 with bbox prompts to produce boolean masks (H,W).
-    Ultralytics returns masks aligned to input size.
-    """
-    if not boxes_xyxy:
-        return []
+        with torch.inference_mode():
+            outputs = model(**batch)
 
-    results = app.state.sam.predict(
-        source=image,
-        bboxes=[list(map(float, b)) for b in boxes_xyxy],
-        verbose=False
-    )
-    r = results[0]
+        processed = proc.post_process_instance_segmentation(
+            outputs,
+            threshold=SAM3_SCORE_THRESH,
+            mask_threshold=SAM3_MASK_THRESH,
+            target_sizes=batch.get("original_sizes").tolist(),
+        )[0]
 
-    masks_bool: List[np.ndarray] = []
-    if r.masks is not None and hasattr(r.masks, "data"):
-        m = r.masks.data  # torch.Tensor
-        m = (m > 0.5).cpu().numpy().astype(bool)
-        for i in range(m.shape[0]):
-            masks_bool.append(m[i])
-    else:
-        W, H = image.size
-        for _ in boxes_xyxy:
-            masks_bool.append(np.zeros((H, W), dtype=bool))
-    return masks_bool
+        masks = processed.get("masks")
+        boxes = processed.get("boxes")
+        scores = processed.get("scores")
+
+        if masks is None:
+            masks_np = []
+        else:
+            masks_np = masks.cpu().numpy()
+            if masks_np.dtype != bool:
+                masks_np = masks_np > 0.5
+
+        instances: List[Instance] = []
+        boxes_seq = boxes if boxes is not None else []
+        scores_seq = scores if scores is not None else []
+
+        for idx, score in enumerate(scores_seq):
+            if len(boxes_seq) > idx:
+                box_tensor = boxes_seq[idx]
+                if hasattr(box_tensor, "detach"):
+                    bbox = box_tensor.detach().cpu().tolist()
+                else:
+                    bbox = list(box_tensor)
+            else:
+                bbox = [0, 0, 0, 0]
+
+            if hasattr(score, "detach"):
+                score_val = float(score.detach().cpu())
+            else:
+                score_val = float(score)
+            mask_arr = masks_np[idx] if len(masks_np) > idx else None
+            instances.append(Instance(
+                score=score_val,
+                bbox=(
+                    float(bbox[0]),
+                    float(bbox[1]),
+                    float(bbox[2]),
+                    float(bbox[3]),
+                ),
+                mask=mask_arr
+            ))
+        all_results.append(instances)
+    return all_results
 
 # ---------------- API ----------------
 @app.post("/predict")
@@ -268,64 +301,47 @@ async def predict(image: UploadFile = File(...)):
     mime = image.content_type or "image/jpeg"
     pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
-    # 1) Gemini → OWLv2-ready phrases (+ optional context)
+    # 1) Gemini → labels (+ optional context)
     lists = step1_gemini_subjects_objects(img_bytes, mime)
     subjects: List[Item] = lists["subjects"]
     objects:  List[Item] = lists["objects"]
 
-    # 2) OWLv2 → boxes for union of labels (with 'person' fallbacks for gendered phrases)
-    vocab = [it.name for it in subjects] + [it.name for it in objects]
-    vocab = _expand_people_queries(vocab)
-    dets = step2_owl_boxes(pil, vocab)
+    # 2) SAM 3 → detection + segmentation for each label (multi-instance aware)
+    subj_instances = _sam3_segment(pil, subjects)
+    obj_instances  = _sam3_segment(pil, objects)
 
-    # Optional debug on total miss
-    if not dets:
-        print("[OWL] No detections for queries:", vocab)
-
-    subj_dets = assign_detections_to_items(subjects, dets)
-    obj_dets  = assign_detections_to_items(objects, dets)
-
-    # Collect all boxes in order (so mask indices line up)
-    all_boxes: List[Tuple[float,float,float,float]] = []
-    index_map: List[Tuple[str,int]] = []  # ("subject"/"object", idx)
-    for i, d in enumerate(subj_dets):
-        if d is not None:
-            all_boxes.append(d.bbox)
-            index_map.append(("subject", i))
-    for i, d in enumerate(obj_dets):
-        if d is not None:
-            all_boxes.append(d.bbox)
-            index_map.append(("object", i))
-
-    # 3) SAM 2.1 → masks for those boxes
-    masks: List[np.ndarray] = []
-    if all_boxes:
-        masks = step3_sam_masks_ultralytics(pil, all_boxes)
-
-    # Build response
-    def pack(items: List[Item], det_list: List[Optional[Det]]) -> List[Dict]:
+    def pack(items: List[Item], instances: List[List[Instance]]) -> List[Dict]:
         out = []
-        for idx, (it, det) in enumerate(zip(items, det_list)):
-            bbox = [int(round(v)) for v in det.bbox] if det else None
-            mask_b64 = None
-            if det:
-                # find its mask by its position in index_map
-                for k, (kind, j) in enumerate(index_map):
-                    if (kind == "subject" and items is subjects and j == idx) or \
-                       (kind == "object" and items is objects and j == idx):
-                        mask_b64 = mask_to_png_b64(masks[k])
-                        break
+        for it, inst_list in zip(items, instances):
+            inst_payload = []
+            for inst in inst_list:
+                mask_b64 = None
+                area = None
+                if inst.mask is not None:
+                    mask_b64 = mask_to_png_b64(inst.mask)
+                    area = int(np.sum(inst.mask))
+                inst_payload.append({
+                    "score": inst.score,
+                    "bbox": [int(round(v)) for v in inst.bbox],
+                    "mask_png_base64": mask_b64,
+                    "mask_area": area,
+                })
             out.append({
                 "name": it.name,
                 "context": it.context,
-                "bbox": bbox,
-                "mask_png_base64": mask_b64
+                "instances": inst_payload,
             })
         return out
 
     resp = {
         "image_size": {"width": pil.width, "height": pil.height},
-        "subjects": pack(subjects, subj_dets),
-        "objects":  pack(objects, obj_dets)
+        "sam3": {
+            "model_path": app.state.sam3_path,
+            "score_threshold": SAM3_SCORE_THRESH,
+            "mask_threshold": SAM3_MASK_THRESH,
+            "device": DEVICE,
+        },
+        "subjects": pack(subjects, subj_instances),
+        "objects":  pack(objects, obj_instances)
     }
     return JSONResponse(resp)
