@@ -2,8 +2,7 @@ steps:
   # Fetch SAM3 weights into build context
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gsutil
-    args: ['-m', 'cp', '-r', 'gs://historiq-sam3', '/workspace/sam3']
-    dir: /
+    args: ['-m', 'cp', '-r', 'gs://historiq-sam3/*', '/workspace/sam3/']
 
   # Build the container image
   - name: 'gcr.io/cloud-builders/docker'
