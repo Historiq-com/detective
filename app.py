@@ -232,11 +232,15 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
     return {"subjects": subs, "objects": objs}
 
 # ---------------- Step 2: SAM 3 detection + segmentation ----------------
-def _to_device(batch: Dict) -> Dict:
+def _move_to_device(batch: Dict, device: str, float_dtype: torch.dtype) -> Dict:
+    """Move tensors to device, casting floating tensors to desired dtype."""
     moved = {}
     for k, v in batch.items():
-        if hasattr(v, "to"):
-            moved[k] = v.to(DEVICE)
+        if isinstance(v, torch.Tensor):
+            if v.is_floating_point():
+                moved[k] = v.to(device=device, dtype=float_dtype, non_blocking=True)
+            else:
+                moved[k] = v.to(device=device, non_blocking=True)
         else:
             moved[k] = v
     return moved
@@ -253,7 +257,7 @@ def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]
     for it in items:
         prompt = it.name.strip()
         batch = proc(images=image, text=prompt, return_tensors="pt")
-        batch = _to_device(batch)
+        batch = _move_to_device(batch, DEVICE, SAM3_DTYPE)
 
         with torch.inference_mode():
             outputs = model(**batch)
