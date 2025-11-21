@@ -1,5 +1,5 @@
 # app.py
-import os, io, json, base64, logging
+import os, io, json, base64, logging, threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Iterable
@@ -110,6 +110,23 @@ def _ensure_sam3_weights() -> Path:
         return dest
     raise FileNotFoundError("SAM3 weights not found locally and no GCS URI provided")
 
+
+def _load_sam3_if_needed():
+    """Lazy-load SAM3 once, thread-safe."""
+    if app.state.sam3_model is not None and app.state.sam3_processor is not None:
+        return
+    with app.state._sam3_lock:
+        if app.state.sam3_model is not None and app.state.sam3_processor is not None:
+            return
+        sam3_path = _ensure_sam3_weights()
+        logging.info(f"[SAM3] Loading model from {sam3_path} on {DEVICE} (dtype={SAM3_DTYPE})")
+        app.state.sam3_model = Sam3Model.from_pretrained(
+            str(sam3_path),
+            torch_dtype=SAM3_DTYPE,
+        ).to(DEVICE).eval()
+        app.state.sam3_processor = Sam3Processor.from_pretrained(str(sam3_path))
+        app.state.sam3_path = str(sam3_path)
+
 # ---------------- Startup: load models ----------------
 @app.on_event("startup")
 def _load_models():
@@ -120,15 +137,11 @@ def _load_models():
         location=LOCATION,
     )
 
-    # SAM 3 (Meta) - detection + segmentation
-    sam3_path = _ensure_sam3_weights()
-    logging.info(f"[SAM3] Loading model from {sam3_path} on {DEVICE} (dtype={SAM3_DTYPE})")
-    app.state.sam3_model = Sam3Model.from_pretrained(
-        str(sam3_path),
-        torch_dtype=SAM3_DTYPE,
-    ).to(DEVICE).eval()
-    app.state.sam3_processor = Sam3Processor.from_pretrained(str(sam3_path))
-    app.state.sam3_path = str(sam3_path)
+    # Lazy-load SAM3 on first request to keep startup fast
+    app.state.sam3_model = None
+    app.state.sam3_processor = None
+    app.state.sam3_path = None
+    app.state._sam3_lock = threading.Lock()
 
 @app.get("/healthz")
 def healthz():
@@ -232,6 +245,7 @@ def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]
     """
     For each item, run SAM3 with a text prompt and return a list of instances.
     """
+    _load_sam3_if_needed()
     proc: Sam3Processor = app.state.sam3_processor
     model: Sam3Model = app.state.sam3_model
 

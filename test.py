@@ -7,7 +7,7 @@ from google.auth import impersonated_credentials
 
 # ---- CONFIG (edit these) -----------------------------------------------------
 # The Cloud Run SERVICE URL **origin only** (no path, no trailing slash):
-BASE_ORIGIN = "https://seg-api-dev-268616946422.us-central1.run.app"
+BASE_ORIGIN = "https://detective-seg-268616946422.us-central1.run.app"
 
 #test on localhost
 #BASE_ORIGIN = "http://localhost:8080"
@@ -82,21 +82,33 @@ def auth_headers(aud: str) -> dict:
 # ---- Calls -------------------------------------------------------------------
 # ... keep your auth helpers as-is ...
 
-BASE_ORIGIN = "https://seg-api-dev-268616946422.us-central1.run.app"
 PREDICT_PATH = "/predict"
 IMAGE_PATH = "testfile.png"
+OUTPUT_PATH = "resp.json"
 
 def post_image(path: str, image_path: str, timeout=600):
     import os, requests
     url = f"{BASE_ORIGIN}{path}"
     with open(image_path, "rb") as f:
         files = {"image": (os.path.basename(image_path), f, "image/png")}
-        r = requests.post(url, files=files, headers=auth_headers(BASE_ORIGIN), timeout=timeout)
+        headers = auth_headers(BASE_ORIGIN)
+        r = requests.post(url, files=files, headers=headers, timeout=timeout)
+    if r.status_code >= 400:
+        logging.error("Request failed: %s\nBody: %s", r.status_code, r.text[:500])
     r.raise_for_status()
     return r
 
 if __name__ == "__main__":
+    # Always fetch a fresh token per run to avoid stale audience/issuer issues
+    _ID_TOKEN_CACHE["token"] = None
+    _ID_TOKEN_CACHE["exp"] = 0
+
     resp = post_image(PREDICT_PATH, IMAGE_PATH)
     print("✅ Predict OK:", resp.status_code)
+    try:
+        with open(OUTPUT_PATH, "w") as f:
+            f.write(resp.text)
+        print(f"✅ Wrote response to {OUTPUT_PATH}")
+    except Exception as e:
+        print(f"⚠️ Failed to write response: {e}")
     print(resp.text[:500])
-
