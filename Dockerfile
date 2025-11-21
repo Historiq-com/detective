@@ -17,6 +17,9 @@ RUN pip install --no-cache-dir uv
 COPY requirements.txt .
 RUN uv pip install --system -r requirements.txt
 
+# SAM3 weights baked into the image (downloaded in Cloud Build step)
+COPY sam3 /app/sam3
+
 COPY app.py /app/app.py
 
 EXPOSE 8080

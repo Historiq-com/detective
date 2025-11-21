@@ -232,18 +232,21 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
     return {"subjects": subs, "objects": objs}
 
 # ---------------- Step 2: SAM 3 detection + segmentation ----------------
-def _move_to_device(batch: Dict, device: str, float_dtype: torch.dtype) -> Dict:
-    """Move tensors to device, casting floating tensors to desired dtype."""
-    moved = {}
-    for k, v in batch.items():
-        if isinstance(v, torch.Tensor):
-            if v.is_floating_point():
-                moved[k] = v.to(device=device, dtype=float_dtype, non_blocking=True)
-            else:
-                moved[k] = v.to(device=device, non_blocking=True)
-        else:
-            moved[k] = v
-    return moved
+def _move_to_device(obj, device: str, float_dtype: torch.dtype):
+    """
+    Recursively move/cast tensors in nested structures to the target device/dtype.
+    Handles dicts, lists, tuples, and tensors.
+    """
+    if isinstance(obj, torch.Tensor):
+        if obj.is_floating_point():
+            return obj.to(device=device, dtype=float_dtype, non_blocking=True)
+        return obj.to(device=device, non_blocking=True)
+    if isinstance(obj, dict):
+        return {k: _move_to_device(v, device, float_dtype) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        seq = [_move_to_device(v, device, float_dtype) for v in obj]
+        return type(obj)(seq)
+    return obj
 
 def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]:
     """
