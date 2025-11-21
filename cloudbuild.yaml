@@ -45,3 +45,5 @@ steps:
 
 images:
   - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg'
+options:
+  logging: CLOUD_LOGGING_ONLY
