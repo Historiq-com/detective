@@ -123,20 +123,24 @@ def _load_sam3_if_needed():
             sam3_path = _ensure_sam3_weights()
             logging.info(f"[SAM3] Loading model from {sam3_path} on {DEVICE} (dtype={SAM3_DTYPE})")
             
-            # Load with low_cpu_mem_usage for faster loading, then move to device
+            # Load model to CPU first
             model = Sam3Model.from_pretrained(
                 str(sam3_path),
-                torch_dtype=SAM3_DTYPE,
+                torch_dtype=torch.float32,  # Load as float32 first
                 low_cpu_mem_usage=True,
             )
-            # Move to device (this will show progress bar but is the most reliable)
+            
+            # Explicitly move to device and convert dtype
             if DEVICE == "cuda":
-                model = model.cuda()
+                model = model.to(device="cuda", dtype=SAM3_DTYPE)
+            else:
+                model = model.to(dtype=SAM3_DTYPE)
+            
             model.eval()
             app.state.sam3_model = model
             app.state.sam3_processor = Sam3Processor.from_pretrained(str(sam3_path))
             app.state.sam3_path = str(sam3_path)
-            logging.info(f"[SAM3] Model loaded successfully")
+            logging.info(f"[SAM3] Model loaded successfully on {DEVICE}")
         except Exception as e:
             logging.error(f"[SAM3] Failed to load model: {e}")
             raise RuntimeError(f"Failed to load SAM3 model: {e}") from e
@@ -280,12 +284,13 @@ def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]
         prompt = it.name.strip()
         batch = proc(images=image, text=prompt, return_tensors="pt")
         
-        # Explicitly ensure tensors are on the correct device and dtype
-        batch = _move_to_device(batch, DEVICE, SAM3_DTYPE)
-        
-        # Double-check pixel_values is in the correct format
-        if "pixel_values" in batch and batch["pixel_values"].dtype != SAM3_DTYPE:
-            batch["pixel_values"] = batch["pixel_values"].to(dtype=SAM3_DTYPE)
+        # Explicitly move all batch tensors to the correct device and dtype
+        for key in batch.keys():
+            if isinstance(batch[key], torch.Tensor):
+                if batch[key].is_floating_point():
+                    batch[key] = batch[key].to(device=DEVICE, dtype=SAM3_DTYPE)
+                else:
+                    batch[key] = batch[key].to(device=DEVICE)
 
         with torch.inference_mode():
             outputs = model(**batch)
