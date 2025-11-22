@@ -120,11 +120,14 @@ def _load_sam3_if_needed():
             return
         sam3_path = _ensure_sam3_weights()
         logging.info(f"[SAM3] Loading model from {sam3_path} on {DEVICE} (dtype={SAM3_DTYPE})")
-        app.state.sam3_model = Sam3Model.from_pretrained(
+        model = Sam3Model.from_pretrained(
             str(sam3_path),
             torch_dtype=SAM3_DTYPE,
-            device_map=DEVICE,
-        ).eval()
+        )
+        # Explicitly move model to device with correct dtype
+        model = model.to(device=DEVICE, dtype=SAM3_DTYPE)
+        model.eval()
+        app.state.sam3_model = model
         app.state.sam3_processor = Sam3Processor.from_pretrained(str(sam3_path))
         app.state.sam3_path = str(sam3_path)
 
