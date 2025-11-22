@@ -31,7 +31,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview")
 SAM3_LOCAL_PATH = os.getenv("SAM3_LOCAL_PATH", "/app/sam3")
 SAM3_LOCAL_FALLBACK = "/Users/dserrentino/sam3"
 SAM3_GCS_URI = os.getenv("SAM3_GCS_URI", "gs://historiq-sam3")
-SAM3_SCORE_THRESH = float(os.getenv("SAM3_SCORE_THRESH", "0.05"))
+SAM3_SCORE_THRESH = float(os.getenv("SAM3_SCORE_THRESH", "0.5"))
 SAM3_MASK_THRESH = float(os.getenv("SAM3_MASK_THRESH", "0.5"))
 
 @dataclass
@@ -196,17 +196,17 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
 
     prompt = (
         "Return ONLY JSON matching the schema.\n"
-        "Goal: produce short SAM3 text prompts (2–6 words) that uniquely identify visible people (subjects) "
-        "and notable non-human items (objects).\n\n"
+        "Goal: Produce short text prompts (1–4 words) suitable for a segmentation model.\n"
+        "List every visually distinct person and every notable non-human object in the image.\n\n"
         "Rules:\n"
-        "- Keep each 'name' to 2–6 words, no commas, no 'and'.\n"
-        "- Be specific: add ONE helpful disambiguator (color/material/action/location).\n"
-        "  Good: 'woman sweeping with broom', 'man eating sandwich', 'blue enamel mug', 'wooden dining chair'.\n"
-        "  Bad: 'cup', 'person with thing'.\n"
-        "- Use 'man'/'woman' only if obvious; otherwise 'person'.\n"
-        "- 'context' is optional; include only if meaningful for archivists.\n"
-        "- No counts/coords/masks. No text outside JSON."
+        "- Each 'name' must be 1–4 words, no commas, no 'and'.\n"
+        "- Use short, concrete, visual labels with exactly one disambiguator such as color, material, action, or relative position.\n"
+        "- Use 'man' or 'woman' only if clearly identifiable; otherwise use 'person'.\n"
+        "- Do not separate multiple similar items into different labels; use a single label that represents the category.\n"
+        "- Include all visible objects, even small or partially visible ones.\n"
+        "- 'context' is optional and should be included only if visually meaningful.\n"
     )
+
 
     part = Part.from_bytes(data=img_bytes, mime_type=mime or "image/jpeg")
     cfg = GenerateContentConfig(
