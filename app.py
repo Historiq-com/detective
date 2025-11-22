@@ -123,7 +123,8 @@ def _load_sam3_if_needed():
         app.state.sam3_model = Sam3Model.from_pretrained(
             str(sam3_path),
             torch_dtype=SAM3_DTYPE,
-        ).to(DEVICE).eval()
+            device_map=DEVICE,
+        ).eval()
         app.state.sam3_processor = Sam3Processor.from_pretrained(str(sam3_path))
         app.state.sam3_path = str(sam3_path)
 
@@ -260,7 +261,13 @@ def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]
     for it in items:
         prompt = it.name.strip()
         batch = proc(images=image, text=prompt, return_tensors="pt")
+        
+        # Explicitly ensure tensors are on the correct device and dtype
         batch = _move_to_device(batch, DEVICE, SAM3_DTYPE)
+        
+        # Double-check pixel_values is in the correct format
+        if "pixel_values" in batch and batch["pixel_values"].dtype != SAM3_DTYPE:
+            batch["pixel_values"] = batch["pixel_values"].to(dtype=SAM3_DTYPE)
 
         with torch.inference_mode():
             outputs = model(**batch)
