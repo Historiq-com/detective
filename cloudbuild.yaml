@@ -7,15 +7,23 @@ steps:
       - |
         mkdir -p /workspace/sam3 && gsutil -m rsync -r gs://historiq-sam3 /workspace/sam3
 
-  # Build the container image
+  # Build the container image with cache
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg', '.']
+    args:
+      - 'build'
+      - '--cache-from'
+      - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg:latest'
+      - '-t'
+      - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg:latest'
+      - '-t'
+      - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg:$SHORT_SHA'
+      - '.'
     env:
       - "CLOUDSDK_CORE_PROJECT=$PROJECT_ID"
 
   # Push the container image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg']
+    args: ['push', '--all-tags', 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg']
     env:
       - "CLOUDSDK_CORE_PROJECT=$PROJECT_ID"
 
@@ -28,7 +36,7 @@ steps:
       - 'deploy'
       - 'detective-seg'
       - '--image'
-      - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg'
+      - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg:$SHORT_SHA'
       - '--region'
       - 'us-central1'
       - '--platform'
@@ -63,3 +71,6 @@ images:
   - 'us-docker.pkg.dev/vlgo-site-567f8/docker/detective-seg'
 options:
   logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'  # Faster build machine
+  env:
+    - 'DOCKER_BUILDKIT=1'  # Enable BuildKit for cache mounts

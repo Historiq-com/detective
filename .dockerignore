@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Testing
+test.py
+testfile.png
+result.json
+resp.json
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+Readme.md
+*.md
+
+# Misc
+headers.txt
+

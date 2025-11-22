@@ -118,18 +118,28 @@ def _load_sam3_if_needed():
     with app.state._sam3_lock:
         if app.state.sam3_model is not None and app.state.sam3_processor is not None:
             return
-        sam3_path = _ensure_sam3_weights()
-        logging.info(f"[SAM3] Loading model from {sam3_path} on {DEVICE} (dtype={SAM3_DTYPE})")
-        model = Sam3Model.from_pretrained(
-            str(sam3_path),
-            torch_dtype=SAM3_DTYPE,
-        )
-        # Explicitly move model to device with correct dtype
-        model = model.to(device=DEVICE, dtype=SAM3_DTYPE)
-        model.eval()
-        app.state.sam3_model = model
-        app.state.sam3_processor = Sam3Processor.from_pretrained(str(sam3_path))
-        app.state.sam3_path = str(sam3_path)
+        
+        try:
+            sam3_path = _ensure_sam3_weights()
+            logging.info(f"[SAM3] Loading model from {sam3_path} on {DEVICE} (dtype={SAM3_DTYPE})")
+            
+            # Load with low_cpu_mem_usage for faster loading, then move to device
+            model = Sam3Model.from_pretrained(
+                str(sam3_path),
+                torch_dtype=SAM3_DTYPE,
+                low_cpu_mem_usage=True,
+            )
+            # Move to device (this will show progress bar but is the most reliable)
+            if DEVICE == "cuda":
+                model = model.cuda()
+            model.eval()
+            app.state.sam3_model = model
+            app.state.sam3_processor = Sam3Processor.from_pretrained(str(sam3_path))
+            app.state.sam3_path = str(sam3_path)
+            logging.info(f"[SAM3] Model loaded successfully")
+        except Exception as e:
+            logging.error(f"[SAM3] Failed to load model: {e}")
+            raise RuntimeError(f"Failed to load SAM3 model: {e}") from e
 
 # ---------------- Startup: load models ----------------
 @app.on_event("startup")
@@ -214,7 +224,12 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
             str(resp.candidates[0].finish_reason) == 'FinishReason.MAX_TOKENS'):
             raise ValueError("Response truncated due to token limit. Consider increasing max_output_tokens.")
         raise ValueError(f"Empty response from Gemini API. Response: {resp}")
-    data = json.loads(resp.text)
+    
+    # Safely parse JSON
+    try:
+        data = json.loads(resp.text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON from Gemini API: {e}. Response: {resp.text[:200]}")
 
     # Cleanup: trim, dedup (case-insensitive), keep optional context
     def _clean(items):
@@ -275,11 +290,17 @@ def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]
         with torch.inference_mode():
             outputs = model(**batch)
 
+        # Safely get original_sizes
+        original_sizes = batch.get("original_sizes")
+        if original_sizes is None:
+            # Fallback to image size if not in batch
+            original_sizes = torch.tensor([[image.height, image.width]])
+        
         processed = proc.post_process_instance_segmentation(
             outputs,
             threshold=SAM3_SCORE_THRESH,
             mask_threshold=SAM3_MASK_THRESH,
-            target_sizes=batch.get("original_sizes").tolist(),
+            target_sizes=original_sizes.tolist(),
         )[0]
 
         masks = processed.get("masks")
@@ -328,51 +349,82 @@ def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]
 # ---------------- API ----------------
 @app.post("/predict")
 async def predict(image: UploadFile = File(...)):
-    img_bytes = await image.read()
-    mime = image.content_type or "image/jpeg"
-    pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    try:
+        img_bytes = await image.read()
+        
+        # Validate file size (prevent OOM)
+        max_size = 50 * 1024 * 1024  # 50MB
+        if len(img_bytes) > max_size:
+            return JSONResponse(
+                {"error": f"Image too large. Max size: {max_size // (1024*1024)}MB"},
+                status_code=400
+            )
+        
+        # Safely load image
+        try:
+            mime = image.content_type or "image/jpeg"
+            pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"Invalid or corrupted image: {str(e)}"},
+                status_code=400
+            )
 
-    # 1) Gemini → labels (+ optional context)
-    lists = step1_gemini_subjects_objects(img_bytes, mime)
-    subjects: List[Item] = lists["subjects"]
-    objects:  List[Item] = lists["objects"]
+        # 1) Gemini → labels (+ optional context)
+        lists = step1_gemini_subjects_objects(img_bytes, mime)
+        subjects: List[Item] = lists["subjects"]
+        objects:  List[Item] = lists["objects"]
 
-    # 2) SAM 3 → detection + segmentation for each label (multi-instance aware)
-    subj_instances = _sam3_segment(pil, subjects)
-    obj_instances  = _sam3_segment(pil, objects)
+        # 2) SAM 3 → detection + segmentation for each label (multi-instance aware)
+        # Skip SAM3 if no items detected
+        subj_instances = _sam3_segment(pil, subjects) if subjects else []
+        obj_instances  = _sam3_segment(pil, objects) if objects else []
 
-    def pack(items: List[Item], instances: List[List[Instance]]) -> List[Dict]:
-        out = []
-        for it, inst_list in zip(items, instances):
-            inst_payload = []
-            for inst in inst_list:
-                mask_b64 = None
-                area = None
-                if inst.mask is not None:
-                    mask_b64 = mask_to_png_b64(inst.mask)
-                    area = int(np.sum(inst.mask))
-                inst_payload.append({
-                    "score": inst.score,
-                    "bbox": [int(round(v)) for v in inst.bbox],
-                    "mask_png_base64": mask_b64,
-                    "mask_area": area,
+        def pack(items: List[Item], instances: List[List[Instance]]) -> List[Dict]:
+            out = []
+            for it, inst_list in zip(items, instances):
+                inst_payload = []
+                for inst in inst_list:
+                    mask_b64 = None
+                    area = None
+                    if inst.mask is not None:
+                        mask_b64 = mask_to_png_b64(inst.mask)
+                        area = int(np.sum(inst.mask))
+                    inst_payload.append({
+                        "score": inst.score,
+                        "bbox": [int(round(v)) for v in inst.bbox],
+                        "mask_png_base64": mask_b64,
+                        "mask_area": area,
+                    })
+                out.append({
+                    "name": it.name,
+                    "context": it.context,
+                    "instances": inst_payload,
                 })
-            out.append({
-                "name": it.name,
-                "context": it.context,
-                "instances": inst_payload,
-            })
-        return out
+            return out
 
-    resp = {
-        "image_size": {"width": pil.width, "height": pil.height},
-        "sam3": {
-            "model_path": app.state.sam3_path,
-            "score_threshold": SAM3_SCORE_THRESH,
-            "mask_threshold": SAM3_MASK_THRESH,
-            "device": DEVICE,
-        },
-        "subjects": pack(subjects, subj_instances),
-        "objects":  pack(objects, obj_instances)
-    }
-    return JSONResponse(resp)
+        resp = {
+            "image_size": {"width": pil.width, "height": pil.height},
+            "sam3": {
+                "model_path": app.state.sam3_path,
+                "score_threshold": SAM3_SCORE_THRESH,
+                "mask_threshold": SAM3_MASK_THRESH,
+                "device": DEVICE,
+            },
+            "subjects": pack(subjects, subj_instances),
+            "objects":  pack(objects, obj_instances)
+        }
+        return JSONResponse(resp)
+    
+    except torch.cuda.OutOfMemoryError as e:
+        logging.error(f"CUDA OOM error: {e}")
+        return JSONResponse(
+            {"error": "GPU out of memory. Try a smaller image or fewer objects."},
+            status_code=503
+        )
+    except Exception as e:
+        logging.error(f"Unexpected error in predict endpoint: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Internal server error: {str(e)}"},
+            status_code=500
+        )
