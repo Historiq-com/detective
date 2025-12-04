@@ -214,7 +214,7 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
         response_schema=schema,
         temperature=0.0,
         top_p=1.0,
-        max_output_tokens=2048,
+        max_output_tokens=4096,
     )
     resp = app.state.gemini.models.generate_content(
         model=GEMINI_MODEL,
