@@ -25,7 +25,7 @@ SAM3_DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 PROJECT  = os.getenv("GOOGLE_CLOUD_PROJECT", "vlgo-site-567f8")
 # Gemini 3 lives in the global multi-region; keep this fixed for simplicity.
 LOCATION = "global"
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-pro-preview")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
 # SAM 3 model storage
 SAM3_LOCAL_PATH = os.getenv("SAM3_LOCAL_PATH", "/app/sam3")
