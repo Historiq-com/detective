@@ -7,7 +7,7 @@ from typing import List, Dict, Optional, Tuple, Iterable
 import numpy as np
 from PIL import Image
 import torch
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 # --- Gemini 3 Pro via Vertex AI (service account / ADC) ---
@@ -33,6 +33,8 @@ SAM3_LOCAL_FALLBACK = "/Users/dserrentino/sam3"
 SAM3_GCS_URI = os.getenv("SAM3_GCS_URI", "gs://historiq-sam3")
 SAM3_SCORE_THRESH = float(os.getenv("SAM3_SCORE_THRESH", "0.5"))
 SAM3_MASK_THRESH = float(os.getenv("SAM3_MASK_THRESH", "0.5"))
+MAX_SEGMENT_OBJECTS = int(os.getenv("MAX_SEGMENT_OBJECTS", "128"))
+MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50MB
 
 @dataclass
 class Item:
@@ -351,6 +353,68 @@ def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]
         all_results.append(instances)
     return all_results
 
+
+def _instance_to_payload(inst: Instance) -> Dict:
+    mask_b64 = None
+    area = None
+    if inst.mask is not None:
+        mask_b64 = mask_to_png_b64(inst.mask)
+        area = int(np.sum(inst.mask))
+    return {
+        "score": inst.score,
+        "bbox": [int(round(v)) for v in inst.bbox],
+        "mask_png_base64": mask_b64,
+        "mask_area": area,
+    }
+
+
+def _pack_labeled_instances(
+    items: List[Item], instances: List[List[Instance]], *, include_context: bool
+) -> List[Dict]:
+    out: List[Dict] = []
+    for it, inst_list in zip(items, instances):
+        row: Dict = {
+            "name": it.name,
+            "instances": [_instance_to_payload(inst) for inst in inst_list],
+        }
+        if include_context:
+            row["context"] = it.context
+        out.append(row)
+    return out
+
+
+def _parse_segment_payload_json(raw: str) -> List[Item]:
+    """Parse multipart JSON: {\"objects\": [\"prompt\", ...] } or objects as {\"name\": \"...\"}."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("JSON must be an object with an 'objects' array")
+    objs = data.get("objects")
+    if objs is None:
+        raise ValueError("Missing required key 'objects' (array of SAM text prompts)")
+    if not isinstance(objs, list):
+        raise ValueError("'objects' must be an array")
+    if len(objs) > MAX_SEGMENT_OBJECTS:
+        raise ValueError(
+            f"Too many prompts ({len(objs)}); max is {MAX_SEGMENT_OBJECTS}. "
+            "Split into multiple requests or set MAX_SEGMENT_OBJECTS."
+        )
+    items: List[Item] = []
+    for i, o in enumerate(objs):
+        if isinstance(o, str):
+            name = " ".join(o.split()).strip()
+        elif isinstance(o, dict):
+            name = " ".join((o.get("name") or "").split()).strip()
+        else:
+            raise ValueError(f"objects[{i}] must be a string or an object with 'name'")
+        if not name:
+            raise ValueError(f"objects[{i}] has an empty prompt")
+        items.append(Item(name=name, context=""))
+    return items
+
+
 # ---------------- API ----------------
 @app.post("/predict")
 async def predict(image: UploadFile = File(...)):
@@ -358,10 +422,9 @@ async def predict(image: UploadFile = File(...)):
         img_bytes = await image.read()
         
         # Validate file size (prevent OOM)
-        max_size = 50 * 1024 * 1024  # 50MB
-        if len(img_bytes) > max_size:
+        if len(img_bytes) > MAX_IMAGE_BYTES:
             return JSONResponse(
-                {"error": f"Image too large. Max size: {max_size // (1024*1024)}MB"},
+                {"error": f"Image too large. Max size: {MAX_IMAGE_BYTES // (1024*1024)}MB"},
                 status_code=400
             )
         
@@ -385,29 +448,6 @@ async def predict(image: UploadFile = File(...)):
         subj_instances = _sam3_segment(pil, subjects) if subjects else []
         obj_instances  = _sam3_segment(pil, objects) if objects else []
 
-        def pack(items: List[Item], instances: List[List[Instance]]) -> List[Dict]:
-            out = []
-            for it, inst_list in zip(items, instances):
-                inst_payload = []
-                for inst in inst_list:
-                    mask_b64 = None
-                    area = None
-                    if inst.mask is not None:
-                        mask_b64 = mask_to_png_b64(inst.mask)
-                        area = int(np.sum(inst.mask))
-                    inst_payload.append({
-                        "score": inst.score,
-                        "bbox": [int(round(v)) for v in inst.bbox],
-                        "mask_png_base64": mask_b64,
-                        "mask_area": area,
-                    })
-                out.append({
-                    "name": it.name,
-                    "context": it.context,
-                    "instances": inst_payload,
-                })
-            return out
-
         resp = {
             "image_size": {"width": pil.width, "height": pil.height},
             "sam3": {
@@ -416,8 +456,8 @@ async def predict(image: UploadFile = File(...)):
                 "mask_threshold": SAM3_MASK_THRESH,
                 "device": DEVICE,
             },
-            "subjects": pack(subjects, subj_instances),
-            "objects":  pack(objects, obj_instances)
+            "subjects": _pack_labeled_instances(subjects, subj_instances, include_context=True),
+            "objects": _pack_labeled_instances(objects, obj_instances, include_context=True),
         }
         return JSONResponse(resp)
     
@@ -432,4 +472,72 @@ async def predict(image: UploadFile = File(...)):
         return JSONResponse(
             {"error": f"Internal server error: {str(e)}"},
             status_code=500
+        )
+
+
+@app.post("/segment")
+async def segment(
+    image: UploadFile = File(...),
+    payload: str = Form(
+        ...,
+        description='JSON: {"objects": ["prompt", ...]} or {"objects": [{"name": "prompt"}, ...]}',
+    ),
+):
+    """
+    SAM 3 only: run text-prompted detection/segmentation for caller-supplied prompts.
+    No Gemini/LLM. Multipart: image file + form field `payload` (JSON with `objects` array).
+    """
+    try:
+        try:
+            items = _parse_segment_payload_json(payload)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+        img_bytes = await image.read()
+        if len(img_bytes) > MAX_IMAGE_BYTES:
+            return JSONResponse(
+                {"error": f"Image too large. Max size: {MAX_IMAGE_BYTES // (1024*1024)}MB"},
+                status_code=400,
+            )
+
+        try:
+            pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"Invalid or corrupted image: {str(e)}"},
+                status_code=400,
+            )
+
+        instances_per_prompt = _sam3_segment(pil, items) if items else []
+        resp = {
+            "image_size": {"width": pil.width, "height": pil.height},
+            "sam3": {
+                "model_path": app.state.sam3_path,
+                "score_threshold": SAM3_SCORE_THRESH,
+                "mask_threshold": SAM3_MASK_THRESH,
+                "device": DEVICE,
+            },
+            "objects": _pack_labeled_instances(
+                items, instances_per_prompt, include_context=False
+            ),
+        }
+        logging.info(
+            "[segment] %d prompt(s), image %dx%d",
+            len(items),
+            pil.width,
+            pil.height,
+        )
+        return JSONResponse(resp)
+
+    except torch.cuda.OutOfMemoryError as e:
+        logging.error(f"CUDA OOM error (segment): {e}")
+        return JSONResponse(
+            {"error": "GPU out of memory. Try a smaller image or fewer prompts."},
+            status_code=503,
+        )
+    except Exception as e:
+        logging.error(f"Unexpected error in segment endpoint: {e}", exc_info=True)
+        return JSONResponse(
+            {"error": f"Internal server error: {str(e)}"},
+            status_code=500,
         )
