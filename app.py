@@ -273,7 +273,13 @@ def _move_to_device(obj, device: str, float_dtype: torch.dtype):
         return type(obj)(seq)
     return obj
 
-def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]:
+def _sam3_segment(
+    image: Image.Image,
+    items: List[Item],
+    *,
+    score_threshold: float = SAM3_SCORE_THRESH,
+    mask_threshold: float = SAM3_MASK_THRESH,
+) -> List[List[Instance]]:
     """
     For each item, run SAM3 with a text prompt and return a list of instances.
     """
@@ -305,8 +311,8 @@ def _sam3_segment(image: Image.Image, items: List[Item]) -> List[List[Instance]]
         
         processed = proc.post_process_instance_segmentation(
             outputs,
-            threshold=SAM3_SCORE_THRESH,
-            mask_threshold=SAM3_MASK_THRESH,
+            threshold=score_threshold,
+            mask_threshold=mask_threshold,
             target_sizes=original_sizes.tolist(),
         )[0]
 
@@ -383,8 +389,20 @@ def _pack_labeled_instances(
     return out
 
 
-def _parse_segment_payload_json(raw: str) -> List[Item]:
-    """Parse multipart JSON: {\"objects\": [\"prompt\", ...] } or objects as {\"name\": \"...\"}."""
+def _parse_optional_threshold(key: str, data: Dict) -> Optional[float]:
+    if key not in data:
+        return None
+    v = data[key]
+    if not isinstance(v, (int, float)):
+        raise ValueError(f"{key} must be a number")
+    f = float(v)
+    if not (0.0 <= f <= 1.0):
+        raise ValueError(f"{key} must be between 0 and 1 inclusive")
+    return f
+
+
+def _parse_segment_payload_json(raw: str) -> Tuple[List[Item], float, float]:
+    """Parse multipart JSON for /segment: objects array plus optional SAM post-process thresholds."""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -401,6 +419,12 @@ def _parse_segment_payload_json(raw: str) -> List[Item]:
             f"Too many prompts ({len(objs)}); max is {MAX_SEGMENT_OBJECTS}. "
             "Split into multiple requests or set MAX_SEGMENT_OBJECTS."
         )
+
+    score_override = _parse_optional_threshold("score_threshold", data)
+    mask_override = _parse_optional_threshold("mask_threshold", data)
+    score_threshold = score_override if score_override is not None else SAM3_SCORE_THRESH
+    mask_threshold = mask_override if mask_override is not None else SAM3_MASK_THRESH
+
     items: List[Item] = []
     for i, o in enumerate(objs):
         if isinstance(o, str):
@@ -412,7 +436,7 @@ def _parse_segment_payload_json(raw: str) -> List[Item]:
         if not name:
             raise ValueError(f"objects[{i}] has an empty prompt")
         items.append(Item(name=name, context=""))
-    return items
+    return items, score_threshold, mask_threshold
 
 
 # ---------------- API ----------------
@@ -480,7 +504,7 @@ async def segment(
     image: UploadFile = File(...),
     payload: str = Form(
         ...,
-        description='JSON: {"objects": ["prompt", ...]} or {"objects": [{"name": "prompt"}, ...]}',
+        description='JSON: objects array; optional score_threshold, mask_threshold (0..1)',
     ),
 ):
     """
@@ -489,7 +513,7 @@ async def segment(
     """
     try:
         try:
-            items = _parse_segment_payload_json(payload)
+            items, score_threshold, mask_threshold = _parse_segment_payload_json(payload)
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -508,13 +532,22 @@ async def segment(
                 status_code=400,
             )
 
-        instances_per_prompt = _sam3_segment(pil, items) if items else []
+        instances_per_prompt = (
+            _sam3_segment(
+                pil,
+                items,
+                score_threshold=score_threshold,
+                mask_threshold=mask_threshold,
+            )
+            if items
+            else []
+        )
         resp = {
             "image_size": {"width": pil.width, "height": pil.height},
             "sam3": {
                 "model_path": app.state.sam3_path,
-                "score_threshold": SAM3_SCORE_THRESH,
-                "mask_threshold": SAM3_MASK_THRESH,
+                "score_threshold": score_threshold,
+                "mask_threshold": mask_threshold,
                 "device": DEVICE,
             },
             "objects": _pack_labeled_instances(
@@ -522,10 +555,12 @@ async def segment(
             ),
         }
         logging.info(
-            "[segment] %d prompt(s), image %dx%d",
+            "[segment] %d prompt(s), image %dx%d, score_threshold=%s, mask_threshold=%s",
             len(items),
             pil.width,
             pil.height,
+            score_threshold,
+            mask_threshold,
         )
         return JSONResponse(resp)
 
