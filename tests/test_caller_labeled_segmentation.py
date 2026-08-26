@@ -39,7 +39,7 @@ def test_caller_labeled_path_uses_photo_analysis_instance_packing() -> None:
     ]
 
 
-def test_sam_uses_context_for_caller_labeled_subject_without_losing_name(
+def test_sam_uses_context_for_caller_labeled_item_without_losing_name(
     monkeypatch,
 ) -> None:
     processor = Mock()

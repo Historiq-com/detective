@@ -568,6 +568,7 @@ async def segment(
                 objects,
                 score_threshold=score_threshold,
                 mask_threshold=mask_threshold,
+                use_context_prompt=True,
             )
             if objects
             else []
