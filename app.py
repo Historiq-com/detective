@@ -279,6 +279,7 @@ def _sam3_segment(
     *,
     score_threshold: float = SAM3_SCORE_THRESH,
     mask_threshold: float = SAM3_MASK_THRESH,
+    use_context_prompt: bool = False,
 ) -> List[List[Instance]]:
     """
     For each item, run SAM3 with a text prompt and return a list of instances.
@@ -289,7 +290,11 @@ def _sam3_segment(
 
     all_results: List[List[Instance]] = []
     for it in items:
-        prompt = it.name.strip()
+        prompt = (
+            it.context.strip()
+            if use_context_prompt and it.context.strip()
+            else it.name.strip()
+        )
         batch = proc(images=image, text=prompt, return_tensors="pt")
         
         # Explicitly move all batch tensors to the correct device and dtype
@@ -552,6 +557,7 @@ async def segment(
                 subjects,
                 score_threshold=score_threshold,
                 mask_threshold=mask_threshold,
+                use_context_prompt=True,
             )
             if subjects
             else []
