@@ -27,16 +27,6 @@ PROJECT  = os.getenv("GOOGLE_CLOUD_PROJECT", "vlgo-site-567f8")
 LOCATION = "global"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 
-CLASSIC_PHOTO_ANALYSIS_SUBJECT_PROMPT = """Goal: Produce short text prompts (1–4 words) suitable for a segmentation model.
-List every visually distinct person and every notable non-human object in the image.
-
-Rules:
-- Each 'name' must be 1–4 words, no commas, no 'and'.
-- Use short, concrete, visual labels with exactly one disambiguator such as color, material, action, or relative position.
-- Use 'man' or 'woman' only if clearly identifiable; otherwise use 'person'.
-- Subject names must be generic common-noun labels. Never use a person's name, named group, title, place, organization, landmark, or other proper noun, even when it appears in captions or nearby text.
-- Do not separate multiple similar items into different labels; use a single label that represents the category."""
-
 # SAM 3 model storage
 SAM3_LOCAL_PATH = os.getenv("SAM3_LOCAL_PATH", "/app/sam3")
 SAM3_LOCAL_FALLBACK = "/Users/dserrentino/sam3"
@@ -208,7 +198,13 @@ def step1_gemini_subjects_objects(img_bytes: bytes, mime: str) -> Dict[str, List
 
     prompt = (
         "Return ONLY JSON matching the schema.\n"
-        f"{CLASSIC_PHOTO_ANALYSIS_SUBJECT_PROMPT}\n"
+        "Goal: Produce short text prompts (1–4 words) suitable for a segmentation model.\n"
+        "List every visually distinct person and every notable non-human object in the image.\n\n"
+        "Rules:\n"
+        "- Each 'name' must be 1–4 words, no commas, no 'and'.\n"
+        "- Use short, concrete, visual labels with exactly one disambiguator such as color, material, action, or relative position.\n"
+        "- Use 'man' or 'woman' only if clearly identifiable; otherwise use 'person'.\n"
+        "- Do not separate multiple similar items into different labels; use a single label that represents the category.\n"
         "- Include all visible objects, even small or partially visible ones.\n"
         "- 'context' is optional and should be included only if visually meaningful.\n"
     )

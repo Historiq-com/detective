@@ -7,29 +7,6 @@ import app
 from app import Item, Instance, _pack_labeled_instances, _parse_segment_payload_json
 
 
-def test_classic_photo_analysis_prompt_forbids_named_subjects(monkeypatch) -> None:
-    assert (
-        "Subject names must be generic common-noun labels. Never use a person's name"
-        in app.CLASSIC_PHOTO_ANALYSIS_SUBJECT_PROMPT
-    )
-    assert "even when it appears in captions or nearby text" in (
-        app.CLASSIC_PHOTO_ANALYSIS_SUBJECT_PROMPT
-    )
-
-    gemini = Mock()
-    gemini.models.generate_content.return_value = Mock(
-        text='{"subjects":[],"objects":[]}'
-    )
-    monkeypatch.setattr(app.app.state, "gemini", gemini, raising=False)
-
-    assert app.step1_gemini_subjects_objects(b"image", "image/jpeg") == {
-        "subjects": [],
-        "objects": [],
-    }
-    prompt = gemini.models.generate_content.call_args.kwargs["contents"][1]
-    assert app.CLASSIC_PHOTO_ANALYSIS_SUBJECT_PROMPT in prompt
-
-
 def test_caller_labels_preserve_subject_object_categories_and_context() -> None:
     labels, score, mask = _parse_segment_payload_json(
         '{"subjects":[{"name":" students ","context":" group portrait "}],'
