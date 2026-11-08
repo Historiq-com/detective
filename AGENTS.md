@@ -19,3 +19,10 @@
 
 - Do not commit model weights, application-default credentials, or identity tokens. Do not add or overwrite response artifacts unless the task explicitly updates a manual fixture.
 - Treat the tracked `resp*.json`, `result.json`, and test image as manual fixtures/artifacts; do not use them as assertions for a passing automated suite.
+
+## Regression protection
+
+- Before changing code, inspect the relevant existing tests and determine whether the proposed change would break or conflict with them. If it would, stop, explain the conflict, and ask the user before changing either the code or the tests.
+- After changing code, run the relevant tests.
+- Do not modify, delete, skip, or weaken existing tests unless the user explicitly requests a behavior change that requires it. If an existing test conflicts with the requested work, stop and ask before changing it.
+- A feature is not complete if any previously passing test fails.
