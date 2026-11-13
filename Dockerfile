@@ -24,6 +24,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/pip \
     uv pip install --system -r requirements.txt
 
+# Fail the image build before deployment if Transformers cannot use the
+# installed PyTorch backend (for example, after an incompatible pin change).
+RUN python -c "import torch; from transformers.utils import is_torch_available; assert is_torch_available(), f'Transformers cannot use PyTorch {torch.__version__}'"
+
 # SAM3 weights baked into the image (large but stable layer)
 COPY sam3 /app/sam3
 

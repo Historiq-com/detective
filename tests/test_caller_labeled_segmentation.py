@@ -84,3 +84,32 @@ def test_legacy_sam_prompt_still_uses_name(monkeypatch) -> None:
     app._sam3_segment(Image.new("RGB", (20, 20)), [item])
 
     assert processor.call_args.kwargs["text"] == "students"
+
+
+def test_startup_loads_sam3_before_service_is_ready(monkeypatch) -> None:
+    sam3_model = object()
+    sam3_processor = object()
+
+    monkeypatch.setattr(app.genai, "Client", Mock(return_value=object()))
+
+    def load_sam3() -> None:
+        app.app.state.sam3_model = sam3_model
+        app.app.state.sam3_processor = sam3_processor
+
+    monkeypatch.setattr(app, "_load_sam3_if_needed", load_sam3)
+
+    app._load_models()
+
+    assert app.app.state.sam3_model is sam3_model
+    assert app.app.state.sam3_processor is sam3_processor
+    assert app.healthz().status_code == 200
+
+
+def test_healthz_rejects_an_unloaded_sam3(monkeypatch) -> None:
+    monkeypatch.setattr(app.app.state, "sam3_model", None, raising=False)
+    monkeypatch.setattr(app.app.state, "sam3_processor", None, raising=False)
+
+    response = app.healthz()
+
+    assert response.status_code == 503
+    assert response.body == b"SAM3 not ready"

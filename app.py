@@ -157,14 +157,23 @@ def _load_models():
         location=LOCATION,
     )
 
-    # Lazy-load SAM3 on first request to keep startup fast
+    # Initialize state before loading so failures leave the service unready.
     app.state.sam3_model = None
     app.state.sam3_processor = None
     app.state.sam3_path = None
     app.state._sam3_lock = threading.Lock()
 
+    # Load SAM3 before the server becomes ready. A broken dependency or model
+    # must fail the revision during deployment, not the first production job.
+    _load_sam3_if_needed()
+
 @app.get("/healthz")
 def healthz():
+    if (
+        getattr(app.state, "sam3_model", None) is None
+        or getattr(app.state, "sam3_processor", None) is None
+    ):
+        return PlainTextResponse("SAM3 not ready", 503)
     return PlainTextResponse("ok", 200)
 
 # ---------------- Step 1: Gemini subjects/objects (SAM3-ready phrases) ----------------

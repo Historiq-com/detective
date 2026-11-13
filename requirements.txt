@@ -2,14 +2,16 @@ fastapi==0.111.0
 uvicorn[standard]==0.30.0
 python-multipart==0.0.9
 
-# Torch 2.5+ required by transformers (tensor parallel / SAM3 plumbing)
-torch==2.5.1
-torchvision==0.20.1
+# Transformers' SAM3 backend requires PyTorch 2.6+. Keep torchvision paired
+# with the matching PyTorch release.
+torch==2.6.0
+torchvision==0.21.0
 numpy==1.26.4
 pillow==10.3.0
 
-# SAM3 support is currently only on transformers main
-transformers @ git+https://github.com/huggingface/transformers.git
+# Pin the tested source revision so unrelated rebuilds cannot change the
+# production runtime underneath an unchanged Detective checkout.
+transformers @ git+https://github.com/huggingface/transformers.git@de35c2b1bff085ac422e45f2dc63618c7789fe52
 huggingface-hub>=0.24.0
 
 google-genai>=0.6.0
